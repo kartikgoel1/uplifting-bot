@@ -89,7 +89,37 @@ def save_state(state):
         json.dump(state, f)
 
 # --- BOT LOGIC ---
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    completed_ids = state["completed"]
+    now = datetime.datetime.now()
+    current_weekday = now.weekday()
+    
+    message = "📋 **Your Agenda for Today**\n\n"
+    
+    # 1. Recurring Goals (Only for today)
+    message += "*Recurring:*\n"
+    has_recurring = False
+    for goal in GOALS_CONFIG:
+        if current_weekday in goal["days"]:
+            has_recurring = True
+            status = "✅" if goal["id"] in completed_ids else "⬜️"
+            message += f"{status} {goal['text']}\n"
+            
+    if not has_recurring:
+        message += "_No recurring goals for today._\n"
+        
+    # 2. Dynamic Tasks (One-offs)
+    message += "\n*One-Offs:*\n"
+    if not state["dynamic_tasks"]:
+        message += "_No extra tasks added._\n"
+    else:
+        for task in state["dynamic_tasks"]:
+            status = "✅" if task["id"] in completed_ids else "⬜️"
+            message += f"{status} {task['text']}\n"
 
+    await update.message.reply_text(message, parse_mode="Markdown")
+    
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_first_name = update.effective_user.first_name
     await update.message.reply_text(
@@ -205,6 +235,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_task))
     application.add_handler(CommandHandler("test", test_nudge))
+    application.add_handler(CommandHandler("list", list_tasks))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     print("Bot is running... Press Ctrl+C to stop.")
