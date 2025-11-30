@@ -191,7 +191,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     # REPLACE WITH YOUR ACTUAL TOKEN
-    TOKEN = "7934889200:AAEtkTAQOh9bLlmdh9CaKBzu0auIErxUE8s"
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TOKEN:
+        print("Error: No token found. Make sure TELEGRAM_TOKEN is set in your environment.")
+        exit(1)
     
     application = ApplicationBuilder().token(TOKEN).build()
     
