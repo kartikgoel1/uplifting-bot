@@ -3,26 +3,28 @@ import json
 import random
 import datetime
 import os
+import uuid
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
 
-# --- 0. TIMEZONE CONFIGURATION (CRITICAL FIX) ---
-# Define IST (Indian Standard Time) as UTC + 5:30
+# --- 0. TIMEZONE CONFIGURATION (IST) ---
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 def get_ist_time():
     """Returns the current time in IST."""
     return datetime.datetime.now(IST)
 
-# --- 1. DUMMY WEB SERVER ---
+# --- 1. DUMMY WEB SERVER (KEEPS RENDER ALIVE) ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
+    
+    # This handles UptimeRobot pings to prevent "501" errors
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
@@ -77,7 +79,6 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-            # Use IST date for resetting
             if data.get("date") != str(get_ist_time().date()):
                 return {"date": str(get_ist_time().date()), "completed": [], "dynamic_tasks": []}
             return data
@@ -89,16 +90,6 @@ def save_state(state):
         json.dump(state, f)
 
 # --- 4. BOT LOGIC ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_first_name = update.effective_user.first_name
-    await update.message.reply_text(
-        f"Hello {user_first_name}. I am online (IST Timezone).\n\n"
-        "I will gently nudge you about your goals.\n"
-        "To add a one-off task, type: `/add Call mom`\n"
-        "To see today's plan, type: `/list`"
-    )
-    context.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=update.effective_chat.id)
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_text = " ".join(context.args)
@@ -120,14 +111,12 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     completed_ids = state["completed"]
-    
-    # --- FIX: USE IST TIME ---
     now = get_ist_time()
     current_weekday = now.weekday()
     
     message = f"📋 **Your Agenda for Today ({now.strftime('%A')})**\n\n"
     
-    # 1. Recurring Goals
+    # Recurring Goals
     message += "*Recurring:*\n"
     has_recurring = False
     for goal in GOALS_CONFIG:
@@ -139,7 +128,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_recurring:
         message += "_No recurring goals for today._\n"
         
-    # 2. Dynamic Tasks
+    # Dynamic Tasks
     message += "\n*One-Offs:*\n"
     if not state["dynamic_tasks"]:
         message += "_No extra tasks added._\n"
@@ -150,22 +139,54 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
+async def done_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    completed_ids = state["completed"]
+    now = get_ist_time()
+    current_weekday = now.weekday()
+    
+    keyboard = []
+    
+    # Add Pending Recurring Goals
+    for goal in GOALS_CONFIG:
+        if current_weekday in goal["days"]:
+            if goal["id"] not in completed_ids:
+                btn = InlineKeyboardButton(f"✅ {goal['text']}", callback_data=f"done_{goal['id']}")
+                keyboard.append([btn])
+                
+    # Add Pending Dynamic Tasks
+    for task in state["dynamic_tasks"]:
+        if task["id"] not in completed_ids:
+            btn = InlineKeyboardButton(f"✅ {task['text']}", callback_data=f"done_{task['id']}")
+            keyboard.append([btn])
+            
+    if not keyboard:
+        await update.message.reply_text("🎉 You have no pending tasks for today!")
+    else:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Select a task to mark as complete:", reply_markup=reply_markup)
+
+async def check_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    ist_now = get_ist_time()
+    await update.message.reply_text(
+        f"🕒 **Internal Clock Check:**\n"
+        f"🌍 UTC: {utc_now.strftime('%H:%M')}\n"
+        f"🇮🇳 IST: {ist_now.strftime('%H:%M')}"
+    )
+
 async def send_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id, task):
     persona = task.get("persona", "general_encourage")
     quote = random.choice(QUOTES.get(persona, QUOTES["general_encourage"]))
     
     message = f"💡 *A thought for you:*\n_{quote}_\n\n👉 **Task:** {task['text']}"
-    
     keyboard = [[InlineKeyboardButton("✅ I Did It", callback_data=f"done_{task['id']}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=reply_markup, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def check_schedule(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.chat_id
+    # Retrieve the chat_id from the job context
+    chat_id = context.job.chat_id
     
-    # --- FIX: USE IST TIME ---
     now = get_ist_time()
     current_hour = now.hour
     current_weekday = now.weekday()
@@ -189,10 +210,6 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE):
         chosen_task = random.choice(candidates)
         await send_nudge(context, chat_id, chosen_task)
 
-async def test_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mock_task = {"id": "test_task", "text": "Test Nudge (You are building this!)", "persona": "maker_creativity"}
-    await send_nudge(context, update.effective_chat.id, mock_task)
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -206,8 +223,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_state(state)
         await query.edit_message_text(text=f"✅ **Well done.** Task marked complete.\n\n_Resting state updated._", parse_mode="Markdown")
 
-# --- 5. EXECUTION ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This is the manual start command
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Hello! I am online (IST).\nType `/list` to see your day.")
+    # Remove old jobs to avoid duplicates if user types /start multiple times
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+    context.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=chat_id, name=str(chat_id))
+
+# --- 5. THE AUTO-START (AMNESIA FIX) ---
+async def post_init(application: Application):
+    # ==========================================
+    # ⚠️ INPUT REQUIRED: PUT YOUR CHAT ID HERE
+    # Get this from @userinfobot
+    MY_CHAT_ID = 2071012504  
+    # ==========================================
+    
+    print(f"🤖 Bot restarting. Auto-starting timer for ID: {MY_CHAT_ID}")
+    
+    try:
+        await application.bot.send_message(chat_id=MY_CHAT_ID, text="🤖 **System Restarted.** I am back online and watching the clock.")
+        # Start the timer automatically without needing /start
+        application.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=MY_CHAT_ID, name=str(MY_CHAT_ID))
+    except Exception as e:
+        print(f"Failed to auto-start: {e}")
+
+# --- 6. EXECUTION ---
 if __name__ == '__main__':
+    # Startup Fingerprint
+    INSTANCE_ID = str(uuid.uuid4())[:8]
+    print(f"🤖 BOT STARTING. Instance ID: {INSTANCE_ID}")
+
+    # Start Web Server for UptimeRobot
     Thread(target=start_server, daemon=True).start()
 
     TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -215,10 +264,14 @@ if __name__ == '__main__':
     if not TOKEN:
         print("CRITICAL ERROR: TELEGRAM_TOKEN not found.")
     else:
-        application = ApplicationBuilder().token(TOKEN).build()
+        # We add post_init here to handle the auto-start
+        application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("add", add_task))
-        application.add_handler(CommandHandler("test", test_nudge))
         application.add_handler(CommandHandler("list", list_tasks)) 
+        application.add_handler(CommandHandler("done", done_menu)) 
+        application.add_handler(CommandHandler("time", check_time))
         application.add_handler(CallbackQueryHandler(button_handler))
+        
         application.run_polling()
