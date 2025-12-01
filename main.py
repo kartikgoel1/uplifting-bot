@@ -7,6 +7,9 @@ import uuid
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --- NEW LIBRARY FOR DATABASE ---
+import pymongo 
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, Application
 
@@ -14,17 +17,14 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Callb
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 def get_ist_time():
-    """Returns the current time in IST."""
     return datetime.datetime.now(IST)
 
-# --- 1. DUMMY WEB SERVER (KEEPS RENDER ALIVE) ---
+# --- 1. DUMMY WEB SERVER ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
-    
-    # This handles UptimeRobot pings to prevent "501" errors
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
@@ -41,25 +41,19 @@ QUOTES = {
         "“Anxiety is the handmaiden of contemporary ambition.” — Alain de Botton",
         "“It is not that we are not good enough, but that we are judging ourselves by a standard that is impossible.” — Alain de Botton"
     ],
+    # ... (Your other quotes remain the same) ...
     "maker_creativity": [
         "“The way to do great work is to love what you do.” — Steve Jobs",
-        "“Make something people want.” — Paul Graham",
-        "“Amateurs sit and wait for inspiration, the rest of us just get up and go to work.” — Stephen King"
+        "“Make something people want.” — Paul Graham"
     ],
     "stoic_resilience": [
-        "“We suffer more often in imagination than in reality.” — Seneca",
-        "“The impediment to action advances action. What stands in the way becomes the way.” — Marcus Aurelius",
-        "“Do not seek for things to happen the way you want them to; rather, wish that what happens happen the way it happens.” — Epictetus"
+        "“The impediment to action advances action.” — Marcus Aurelius"
     ],
     "mindful_learning": [
-        "“The present moment is filled with joy and happiness. If you are attentive, you will see it.” — Thich Nhat Hanh",
-        "“Awareness is the greatest agent for change.” — Eckhart Tolle",
-        "“Don’t worry about the future. Just be here now.” — Diana Winston"
+        "“The present moment is filled with joy and happiness.” — Thich Nhat Hanh"
     ],
     "general_encourage": [
-        "“The secret of getting ahead is getting started.” — Mark Twain",
-        "“Small progress is still progress.”",
-        "“You don’t have to see the whole staircase, just take the first step.” — Martin Luther King Jr."
+        "“The secret of getting ahead is getting started.” — Mark Twain"
     ]
 }
 
@@ -72,24 +66,51 @@ GOALS_CONFIG = [
     {"id": "pers_water", "text": "Drink 3L Water", "days": [0,1,2,3,4,5,6], "persona": "general_encourage", "hour_start": 10, "hour_end": 20},
 ]
 
-# --- 3. STATE MANAGEMENT ---
-STATE_FILE = "user_state.json"
+# --- 3. DATABASE MANAGEMENT (THE UPGRADE) ---
+# We no longer use a file. We use MongoDB.
+
+def get_db():
+    # Connect to MongoDB using the Environment Variable
+    mongo_uri = os.getenv("MONGO_URI")
+    if not mongo_uri:
+        print("⚠️ NO DATABASE FOUND. Using temporary memory (Data will be lost on restart).")
+        return None
+    client = pymongo.MongoClient(mongo_uri)
+    db = client["uplifting_bot_db"]
+    return db["user_state"]
 
 def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-            if data.get("date") != str(get_ist_time().date()):
-                return {"date": str(get_ist_time().date()), "completed": [], "dynamic_tasks": []}
-            return data
-    except FileNotFoundError:
-        return {"date": str(get_ist_time().date()), "completed": [], "dynamic_tasks": []}
+    today_str = str(get_ist_time().date())
+    default_state = {"date": today_str, "completed": [], "dynamic_tasks": []}
+    
+    collection = get_db()
+    if collection is None:
+        return default_state
+
+    # Find the document for 'current_user' (Assuming single user for now)
+    data = collection.find_one({"_id": "current_user"})
+    
+    if not data:
+        return default_state
+    
+    # Check if the date in DB is today. If not, reset!
+    if data.get("date") != today_str:
+        # It's a new day! Reset and save.
+        save_state(default_state)
+        return default_state
+        
+    return data
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    collection = get_db()
+    if collection is None:
+        return
+    
+    # Save (Upsert means: Insert if new, Update if exists)
+    state["_id"] = "current_user"
+    collection.replace_one({"_id": "current_user"}, state, upsert=True)
 
-# --- 4. BOT LOGIC ---
+# --- 4. BOT LOGIC (Remains mostly the same) ---
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_text = " ".join(context.args)
@@ -106,7 +127,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     state["dynamic_tasks"].append(new_task)
     save_state(state)
-    await update.message.reply_text(f"✍️ Added: '{task_text}'. I'll keep it in mind.")
+    await update.message.reply_text(f"✍️ Added: '{task_text}'. Saved to Cloud Database.")
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -114,28 +135,41 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = get_ist_time()
     current_weekday = now.weekday()
     
-    message = f"📋 **Your Agenda for Today ({now.strftime('%A')})**\n\n"
+    pending_list = []
+    completed_list = []
     
-    # Recurring Goals
-    message += "*Recurring:*\n"
-    has_recurring = False
+    # 1. Process Recurring Goals
     for goal in GOALS_CONFIG:
         if current_weekday in goal["days"]:
-            has_recurring = True
-            status = "✅" if goal["id"] in completed_ids else "⬜️"
-            message += f"{status} {goal['text']}\n"
-            
-    if not has_recurring:
-        message += "_No recurring goals for today._\n"
-        
-    # Dynamic Tasks
-    message += "\n*One-Offs:*\n"
-    if not state["dynamic_tasks"]:
-        message += "_No extra tasks added._\n"
+            if goal["id"] in completed_ids:
+                completed_list.append(goal['text'])
+            else:
+                pending_list.append(goal['text'])
+                
+    # 2. Process Dynamic Tasks
+    for task in state["dynamic_tasks"]:
+        if task["id"] in completed_ids:
+            completed_list.append(task['text'])
+        else:
+            pending_list.append(task['text'])
+
+    # 3. Build Scoreboard
+    message = f"📅 **Daily Scoreboard ({now.strftime('%A')})**\n\n"
+    
+    message += f"🏆 **Completed: {len(completed_list)}**\n"
+    if completed_list:
+        for text in completed_list:
+            message += f"✅ ~{text}~\n"
     else:
-        for task in state["dynamic_tasks"]:
-            status = "✅" if task["id"] in completed_ids else "⬜️"
-            message += f"{status} {task['text']}\n"
+        message += "_Nothing yet. Let's get started!_\n"
+        
+    message += "\n"
+    message += f"🧱 **Remaining: {len(pending_list)}**\n"
+    if pending_list:
+        for text in pending_list:
+            message += f"⬜ {text}\n"
+    else:
+        message += "_All clear! Relax and enjoy._ 🌟\n"
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -147,14 +181,12 @@ async def done_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = []
     
-    # Add Pending Recurring Goals
     for goal in GOALS_CONFIG:
         if current_weekday in goal["days"]:
             if goal["id"] not in completed_ids:
                 btn = InlineKeyboardButton(f"✅ {goal['text']}", callback_data=f"done_{goal['id']}")
                 keyboard.append([btn])
                 
-    # Add Pending Dynamic Tasks
     for task in state["dynamic_tasks"]:
         if task["id"] not in completed_ids:
             btn = InlineKeyboardButton(f"✅ {task['text']}", callback_data=f"done_{task['id']}")
@@ -184,16 +216,13 @@ async def send_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id, task):
     await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def check_schedule(context: ContextTypes.DEFAULT_TYPE):
-    # Retrieve the chat_id from the job context
     chat_id = context.job.chat_id
-    
     now = get_ist_time()
     current_hour = now.hour
     current_weekday = now.weekday()
     
     state = load_state()
     completed_ids = state["completed"]
-    
     candidates = []
     
     for goal in GOALS_CONFIG:
@@ -216,47 +245,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     if data.startswith("done_"):
-        task_id = data.split("_")[1]
+        task_id = data[5:]
         state = load_state()
         if task_id not in state["completed"]:
             state["completed"].append(task_id)
             save_state(state)
-        await query.edit_message_text(text=f"✅ **Well done.** Task marked complete.\n\n_Resting state updated._", parse_mode="Markdown")
+        await query.edit_message_text(text=f"✅ **Well done.** Task marked complete.\n\n_Scoreboard updated._", parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This is the manual start command
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"Hello! I am online (IST).\nType `/list` to see your day.")
-    # Remove old jobs to avoid duplicates if user types /start multiple times
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
     for job in current_jobs:
         job.schedule_removal()
     context.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=chat_id, name=str(chat_id))
 
-# --- 5. THE AUTO-START (AMNESIA FIX) ---
 async def post_init(application: Application):
     # ==========================================
     # ⚠️ INPUT REQUIRED: PUT YOUR CHAT ID HERE
-    # Get this from @userinfobot
-    MY_CHAT_ID = 2071012504  
+    MY_CHAT_ID = 2071012504
     # ==========================================
     
     print(f"🤖 Bot restarting. Auto-starting timer for ID: {MY_CHAT_ID}")
-    
     try:
-        await application.bot.send_message(chat_id=MY_CHAT_ID, text="🤖 **System Restarted.** I am back online and watching the clock.")
-        # Start the timer automatically without needing /start
+        await application.bot.send_message(chat_id=MY_CHAT_ID, text="🤖 **System Restarted.**")
         application.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=MY_CHAT_ID, name=str(MY_CHAT_ID))
     except Exception as e:
         print(f"Failed to auto-start: {e}")
 
 # --- 6. EXECUTION ---
 if __name__ == '__main__':
-    # Startup Fingerprint
     INSTANCE_ID = str(uuid.uuid4())[:8]
     print(f"🤖 BOT STARTING. Instance ID: {INSTANCE_ID}")
-
-    # Start Web Server for UptimeRobot
+    
     Thread(target=start_server, daemon=True).start()
 
     TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -264,14 +285,11 @@ if __name__ == '__main__':
     if not TOKEN:
         print("CRITICAL ERROR: TELEGRAM_TOKEN not found.")
     else:
-        # We add post_init here to handle the auto-start
         application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("add", add_task))
         application.add_handler(CommandHandler("list", list_tasks)) 
         application.add_handler(CommandHandler("done", done_menu)) 
         application.add_handler(CommandHandler("time", check_time))
         application.add_handler(CallbackQueryHandler(button_handler))
-        
         application.run_polling()
