@@ -263,6 +263,25 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
+async def view_backlog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    backlog = state.get("backlog", [])
+    
+    if not backlog:
+        await update.message.reply_text("📦 **Backlog is empty.**\nYou are all caught up!", parse_mode="Markdown")
+        return
+
+    message = f"📦 **Backlog ({len(backlog)} items)**\n"
+    message += "_These are waiting for a free slot or tomorrow morning._\n\n"
+    
+    for task in backlog:
+        # Show if it's urgent (though urgent usually skips backlog, good to be safe)
+        prefix = "🔥 " if task.get("is_urgent") else "💤 "
+        message += f"{prefix} {task['text']}\n"
+        
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
 async def delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     completed_ids = state.get("completed_ids", [])
@@ -408,6 +427,7 @@ if __name__ == '__main__':
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("add", add_task))
         application.add_handler(CommandHandler("list", list_tasks)) 
+        application.add_handler(CommandHandler("backlog", view_backlog))
         application.add_handler(CommandHandler("done", done_menu)) 
         application.add_handler(CommandHandler("delete", delete_menu)) 
         application.add_handler(CommandHandler("time", check_time))
