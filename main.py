@@ -4,6 +4,7 @@ import random
 import datetime
 import os
 import uuid
+import time
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pymongo 
@@ -32,16 +33,14 @@ def start_server():
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
     server.serve_forever()
 
-# --- 2. CONFIGURATION ---
+# --- 2. CONFIGURATION (RESTORED JSON LOADING) ---
 
-# Load Quotes from JSON file
 def load_quotes():
     try:
         with open("quotes.json", "r") as f:
             return json.load(f)
     except Exception as e:
         print(f"⚠️ Error loading quotes.json: {e}")
-        # Fallback quotes if file fails
         return {
             "general_encourage": ["“Keep going.”", "“You got this.”"]
         }
@@ -57,7 +56,10 @@ GOALS_CONFIG = [
     {"id": "pers_water", "text": "Drink 3L Water", "days": [0,1,2,3,4,5,6], "persona": "general_encourage", "hour_start": 10, "hour_end": 20},
 ]
 
-# --- 3. DATABASE MANAGEMENT ---
+# --- 3. DATABASE MANAGEMENT (BACKLOG + PRIORITY) ---
+
+DAILY_CAPACITY = 15
+
 def get_db():
     mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
@@ -65,12 +67,20 @@ def get_db():
         return None
     client = pymongo.MongoClient(mongo_uri)
     db = client["uplifting_bot_db"]
-    return db["user_state"]
+    # We switch to 'user_state_v2' to support the new Backlog structure safely
+    return db["user_state_v2"] 
 
 def load_state():
     today_str = str(get_ist_time().date())
-    # Default includes last_nudge_time for cool-down logic
-    default_state = {"date": today_str, "completed": [], "dynamic_tasks": [], "last_nudge_timestamp": 0}
+    
+    # New Data Structure: Separate Active List and Backlog
+    default_state = {
+        "date": today_str, 
+        "active_tasks": [], # The 15 tasks for today
+        "backlog": [],      # The waiting room
+        "completed_ids": [], 
+        "last_nudge_timestamp": 0
+    }
     
     collection = get_db()
     if collection is None:
@@ -80,11 +90,42 @@ def load_state():
     if not data:
         return default_state
     
+    # --- THE MORNING ELECTION (ROLLOVER LOGIC) ---
     if data.get("date") != today_str:
-        # Reset daily but KEEP last_nudge_timestamp to prevent spam on midnight rollover
+        print("🌅 New Day Detected! Running Election...")
+        
+        # 1. Gather ALL pending tasks (Active + Backlog + Old Dynamic) from yesterday
+        # Note: We merge 'dynamic_tasks' here to support migration from your old schema
+        old_active = data.get("active_tasks", []) + data.get("dynamic_tasks", [])
+        old_backlog = data.get("backlog", [])
+        completed_ids = data.get("completed_ids", [])
+        
+        # Filter out completed tasks
+        pool = []
+        for task in old_active + old_backlog:
+            if task["id"] not in completed_ids:
+                # Reset 'valid_from_hour' so deferred tasks wake up
+                task["valid_from_hour"] = 0
+                pool.append(task)
+        
+        # 2. Sort the Pool: URGENT first, then OLDEST (created_at)
+        # We assume tasks might miss 'created_at' if they are old, so we use time.time() as fallback
+        pool.sort(key=lambda x: (not x.get("is_urgent", False), x.get("created_at", time.time())))
+        
+        # 3. Pick the Winners (Top 15)
+        new_active = pool[:DAILY_CAPACITY]
+        new_backlog = pool[DAILY_CAPACITY:]
+        
         last_nudge = data.get("last_nudge_timestamp", 0)
-        new_state = default_state.copy()
-        new_state["last_nudge_timestamp"] = last_nudge
+        
+        new_state = {
+            "date": today_str,
+            "active_tasks": new_active,
+            "backlog": new_backlog,
+            "completed_ids": [], # Reset completed for recurring goals
+            "last_nudge_timestamp": last_nudge
+        }
+        
         save_state(new_state)
         return new_state
         
@@ -99,28 +140,36 @@ def save_state(state):
 
 # --- 4. BOT LOGIC ---
 
-# --- NEW: SMART ADD FUNCTION ---
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = " ".join(context.args)
     if not raw_text:
-        await update.message.reply_text("Example: `/add Check laundry evening`")
+        await update.message.reply_text("Example: `/add Pay bills urgent` or `/add Laundry evening`")
         return
 
-    # Keyword Parsing Logic
+    # Logic: Keyword Parsing (MERGED)
     lower_text = raw_text.lower()
-    start_hour = 0 # Default: Active immediately
+    start_hour = 0
+    is_urgent = False
     
-    clean_text = raw_text # The text without the keyword
+    clean_text = raw_text
     
-    if lower_text.endswith("morning"):
+    # Check Urgent Keyword
+    if "urgent" in lower_text:
+        is_urgent = True
+        # Remove 'urgent' word cleanly
+        import re
+        clean_text = re.sub(r'(?i)\burgent\b', '', clean_text).strip()
+    
+    # Check Time Keywords
+    if clean_text.lower().endswith("morning"):
         start_hour = 9
-        clean_text = raw_text[:-7].strip() # Remove 'morning'
-    elif lower_text.endswith("afternoon"):
+        clean_text = clean_text[:-7].strip()
+    elif clean_text.lower().endswith("afternoon"):
         start_hour = 14
-        clean_text = raw_text[:-9].strip() # Remove 'afternoon'
-    elif lower_text.endswith("evening"):
+        clean_text = clean_text[:-9].strip()
+    elif clean_text.lower().endswith("evening"):
         start_hour = 18
-        clean_text = raw_text[:-7].strip() # Remove 'evening'
+        clean_text = clean_text[:-7].strip()
     
     state = load_state()
     new_task = {
@@ -128,73 +177,132 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "text": clean_text,
         "persona": "general_encourage",
         "type": "dynamic",
-        "valid_from_hour": start_hour  # Save the start time
+        "valid_from_hour": start_hour,
+        "is_urgent": is_urgent,
+        "created_at": time.time()
     }
-    state["dynamic_tasks"].append(new_task)
-    save_state(state)
     
-    confirm_msg = f"✍️ Added: '{clean_text}'."
+    # Logic: Capacity Check
+    active_count = len(state["active_tasks"])
+    
+    msg = ""
+    
+    if is_urgent:
+        # VIP Lane: Add to active even if full
+        state["active_tasks"].append(new_task)
+        msg = f"🚨 **Urgent Task Added.**\n'{clean_text}' is now on your active list (Priority)."
+    elif active_count < DAILY_CAPACITY:
+        # Normal Lane: Add to active
+        state["active_tasks"].append(new_task)
+        msg = f"✍️ Added: '{clean_text}' to today's list."
+    else:
+        # Overflow: Add to Backlog
+        state["backlog"].append(new_task)
+        msg = f"📦 **List Full ({active_count}/{DAILY_CAPACITY}).**\nSaved '{clean_text}' to Backlog. It will wait for a free slot."
+
     if start_hour > 0:
-        confirm_msg += f"\n⏳ I'll stay silent about this until **{start_hour}:00**."
-        
-    await update.message.reply_text(confirm_msg, parse_mode="Markdown")
+        msg += f"\n⏳ Silent until {start_hour}:00."
+
+    save_state(state)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    completed_ids = state["completed"]
+    completed_ids = state.get("completed_ids", []) # Safe get
     now = get_ist_time()
     current_weekday = now.weekday()
     
-    pending_list = []
-    completed_list = []
+    # Recurring Goals
+    recurring_pending = []
+    recurring_done = []
     
     for goal in GOALS_CONFIG:
         if current_weekday in goal["days"]:
             if goal["id"] in completed_ids:
-                completed_list.append(goal['text'])
+                recurring_done.append(goal['text'])
             else:
-                pending_list.append(goal['text'])
-                
-    for task in state["dynamic_tasks"]:
+                recurring_pending.append(goal['text'])
+    
+    # Dynamic Tasks (Active Only)
+    active_tasks = state["active_tasks"]
+    dyn_pending = []
+    dyn_done = []
+    
+    for task in active_tasks:
         if task["id"] in completed_ids:
-            completed_list.append(task['text'])
+            dyn_done.append(task['text'])
         else:
-            pending_list.append(task['text'])
+            txt = task['text']
+            if task.get("is_urgent"):
+                txt = "🔥 " + txt
+            dyn_pending.append(txt)
 
-    message = f"📅 **Daily Scoreboard ({now.strftime('%A')})**\n\n"
-    message += f"🏆 **Completed: {len(completed_list)}**\n"
-    for text in completed_list:
-        message += f"✅ ~{text}~\n"
+    # Scoreboard Construction
+    message = f"📅 **Daily Scoreboard ({now.strftime('%A')})**\n"
+    message += f"Capacity: {len(active_tasks)}/{DAILY_CAPACITY}\n\n"
+    
+    message += f"🏆 **Completed**\n"
+    for t in recurring_done + dyn_done:
+        message += f"✅ ~{t}~\n"
+    if not (recurring_done + dyn_done):
+        message += "_No wins yet._\n"
         
     message += "\n"
-    message += f"🧱 **Remaining: {len(pending_list)}**\n"
-    for text in pending_list:
-        message += f"⬜ {text}\n"
+    message += f"🧱 **Remaining**\n"
+    for t in recurring_pending:
+        message += f"🔘 {t} (Goal)\n"
+    for t in dyn_pending:
+        message += f"⬜ {t}\n"
+    
+    if not (recurring_pending + dyn_pending):
+        message += "_All clear!_\n"
+        
+    backlog_count = len(state.get("backlog", []))
+    if backlog_count > 0:
+        message += f"\n📦 _Backlog: {backlog_count} items waiting._"
 
     await update.message.reply_text(message, parse_mode="Markdown")
 
+async def delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    completed_ids = state.get("completed_ids", [])
+    
+    keyboard = []
+    for task in state["active_tasks"]:
+        if task["id"] not in completed_ids:
+            btn = InlineKeyboardButton(f"🗑 {task['text']}", callback_data=f"del_{task['id']}")
+            keyboard.append([btn])
+            
+    if not keyboard:
+        await update.message.reply_text("Nothing to delete from your active list.")
+    else:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Select a task to **Permanently Delete**:", reply_markup=reply_markup)
+
 async def done_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    completed_ids = state["completed"]
+    completed_ids = state.get("completed_ids", [])
     now = get_ist_time()
     current_weekday = now.weekday()
     
     keyboard = []
+    
     for goal in GOALS_CONFIG:
         if current_weekday in goal["days"]:
             if goal["id"] not in completed_ids:
                 btn = InlineKeyboardButton(f"✅ {goal['text']}", callback_data=f"done_{goal['id']}")
                 keyboard.append([btn])
-    for task in state["dynamic_tasks"]:
+                
+    for task in state["active_tasks"]:
         if task["id"] not in completed_ids:
             btn = InlineKeyboardButton(f"✅ {task['text']}", callback_data=f"done_{task['id']}")
             keyboard.append([btn])
             
     if not keyboard:
-        await update.message.reply_text("🎉 No pending tasks!")
+        await update.message.reply_text("🎉 You have no pending tasks for today!")
     else:
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("Select task to complete:", reply_markup=reply_markup)
+        await update.message.reply_text("Select a task to mark as complete:", reply_markup=reply_markup)
 
 async def check_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     utc_now = datetime.datetime.now(datetime.timezone.utc)
@@ -208,51 +316,41 @@ async def send_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id, task):
     message = f"💡 *A thought for you:*\n_{quote}_\n\n👉 **Task:** {task['text']}"
     keyboard = [[InlineKeyboardButton("✅ I Did It", callback_data=f"done_{task['id']}")]]
     
-    # Update Last Nudge Timestamp
     state = load_state()
     state["last_nudge_timestamp"] = get_ist_time().timestamp()
     save_state(state)
     
     await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# --- NEW: INTELLIGENT SCHEDULER ---
 async def check_schedule(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     now = get_ist_time()
     current_hour = now.hour
     current_weekday = now.weekday()
-    
     state = load_state()
     
-    # 1. GLOBAL COOL-DOWN CHECK
+    # 1. GLOBAL COOL-DOWN CHECK (60 Minutes)
     last_nudge = state.get("last_nudge_timestamp", 0)
     current_ts = now.timestamp()
-    
-    # --- CHANGED HERE: 3600 seconds = 1 Hour ---
     if (current_ts - last_nudge) < 3600:
-        # Too soon! Stay silent.
-        return
+        return # Too soon
 
-    completed_ids = state["completed"]
+    completed_ids = state.get("completed_ids", [])
     candidates = []
     
-    # 2. Check Recurring Goals
     for goal in GOALS_CONFIG:
         if goal["id"] not in completed_ids:
             if current_weekday in goal["days"]:
                 if goal["hour_start"] <= current_hour < goal["hour_end"]:
                     candidates.append(goal)
     
-    # 3. Check Dynamic Tasks (With Time Logic)
-    for task in state["dynamic_tasks"]:
+    for task in state["active_tasks"]:
         if task["id"] not in completed_ids:
-            # SAFETY CHECK: If 'valid_from_hour' is missing (old data), assume 0
+            # Check Time Deferral (Smart Add)
             start_time = task.get("valid_from_hour", 0)
-            
             if current_hour >= start_time:
                 candidates.append(task)
             
-    # 4. Trigger Logic
     if candidates: 
         chosen_task = random.choice(candidates)
         await send_nudge(context, chat_id, chosen_task)
@@ -261,13 +359,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    state = load_state()
+    
     if data.startswith("done_"):
         task_id = data[5:]
-        state = load_state()
-        if task_id not in state["completed"]:
-            state["completed"].append(task_id)
+        if task_id not in state["completed_ids"]:
+            state["completed_ids"].append(task_id)
             save_state(state)
-        await query.edit_message_text(text=f"✅ **Well done.** Task marked complete.\n\n_Scoreboard updated._", parse_mode="Markdown")
+        await query.edit_message_text(text=f"✅ **Well done.** Task marked complete.", parse_mode="Markdown")
+
+    elif data.startswith("del_"):
+        task_id = data[4:]
+        # Remove from Active Tasks
+        state["active_tasks"] = [t for t in state["active_tasks"] if t["id"] != task_id]
+        save_state(state)
+        await query.edit_message_text(text=f"🗑 Task deleted.", parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -280,10 +386,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     # ==========================================
     # ⚠️ INPUT REQUIRED: PUT YOUR CHAT ID HERE
-    MY_CHAT_ID = 2071012504 
+    MY_CHAT_ID = 2071012504
     # ==========================================
     try:
-        await application.bot.send_message(chat_id=MY_CHAT_ID, text="🤖 **Smart Scheduler Active.** (Cool-down: 45m)")
+        await application.bot.send_message(chat_id=MY_CHAT_ID, text="🤖 **Smart Scheduler V2 Active.**\n(Capacity: 15 | Backlog Enabled)")
         application.job_queue.run_repeating(check_schedule, interval=60, first=10, chat_id=MY_CHAT_ID, name=str(MY_CHAT_ID))
     except Exception as e:
         print(f"Failed to auto-start: {e}")
@@ -293,7 +399,6 @@ if __name__ == '__main__':
     print(f"🤖 BOT STARTING. Instance ID: {INSTANCE_ID}")
     
     Thread(target=start_server, daemon=True).start()
-
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     
     if not TOKEN:
@@ -304,6 +409,7 @@ if __name__ == '__main__':
         application.add_handler(CommandHandler("add", add_task))
         application.add_handler(CommandHandler("list", list_tasks)) 
         application.add_handler(CommandHandler("done", done_menu)) 
+        application.add_handler(CommandHandler("delete", delete_menu)) 
         application.add_handler(CommandHandler("time", check_time))
         application.add_handler(CallbackQueryHandler(button_handler))
         application.run_polling()
