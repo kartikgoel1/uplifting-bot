@@ -33,33 +33,20 @@ def start_server():
     server.serve_forever()
 
 # --- 2. CONFIGURATION ---
-QUOTES = {
-    "alain_meaning": [
-        "“Work is one of the ways in which we can dignify our suffering.” — Alain de Botton",
-        "“Anxiety is the handmaiden of contemporary ambition.” — Alain de Botton",
-        "“It is not that we are not good enough, but that we are judging ourselves by a standard that is impossible.” — Alain de Botton"
-    ],
-    "maker_creativity": [
-        "“The way to do great work is to love what you do.” — Steve Jobs",
-        "“Make something people want.” — Paul Graham",
-        "“Amateurs sit and wait for inspiration, the rest of us just get up and go to work.” — Stephen King"
-    ],
-    "stoic_resilience": [
-        "“We suffer more often in imagination than in reality.” — Seneca",
-        "“The impediment to action advances action. What stands in the way becomes the way.” — Marcus Aurelius",
-        "“Do not seek for things to happen the way you want them to; rather, wish that what happens happen the way it happens.” — Epictetus"
-    ],
-    "mindful_learning": [
-        "“The present moment is filled with joy and happiness. If you are attentive, you will see it.” — Thich Nhat Hanh",
-        "“Awareness is the greatest agent for change.” — Eckhart Tolle",
-        "“Don’t worry about the future. Just be here now.” — Diana Winston"
-    ],
-    "general_encourage": [
-        "“The secret of getting ahead is getting started.” — Mark Twain",
-        "“Small progress is still progress.”",
-        "“You don’t have to see the whole staircase, just take the first step.” — Martin Luther King Jr."
-    ]
-}
+
+# Load Quotes from JSON file
+def load_quotes():
+    try:
+        with open("quotes.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Error loading quotes.json: {e}")
+        # Fallback quotes if file fails
+        return {
+            "general_encourage": ["“Keep going.”", "“You got this.”"]
+        }
+
+QUOTES = load_quotes()
 
 GOALS_CONFIG = [
     {"id": "work_prod", "text": "1 hr Product Knowledge/Integration", "days": [0,1,2,3,4], "persona": "alain_meaning", "hour_start": 9, "hour_end": 12},
