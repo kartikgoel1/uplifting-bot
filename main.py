@@ -10,7 +10,7 @@ from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import pymongo
-import google.generativeai as genai
+from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
@@ -222,8 +222,7 @@ def get_ai_response(prompt: str, context_summary: str) -> str:
         return quote
 
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        client = genai.Client(api_key=api_key)
 
         full_prompt = f"""You are a personal accountability coach for Kartik. Your style: direct, warm, specific. Never generic motivational-poster language.
 
@@ -241,7 +240,7 @@ Rules:
 - Sound like a thoughtful human, not an app
 - No filler phrases like "That's great!" or "Absolutely!"
 """
-        response = model.generate_content(full_prompt)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=full_prompt)
         return response.text.strip()
 
     except Exception as e:
