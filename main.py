@@ -222,7 +222,7 @@ def get_ai_response(prompt: str, context_summary: str) -> str:
         return quote
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1"})
 
         full_prompt = f"""You are a personal accountability coach for Kartik. Your style: direct, warm, specific. Never generic motivational-poster language.
 
