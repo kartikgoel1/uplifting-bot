@@ -2,3 +2,4 @@ python-telegram-bot
 apscheduler
 pymongo
 dnspython
+google-generativeai
