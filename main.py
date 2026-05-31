@@ -240,7 +240,7 @@ Rules:
 - Sound like a thoughtful human, not an app
 - No filler phrases like "That's great!" or "Absolutely!"
 """
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=full_prompt)
+        response = client.models.generate_content(model="gemini-1.5-flash", contents=full_prompt)
         return response.text.strip()
 
     except Exception as e:
